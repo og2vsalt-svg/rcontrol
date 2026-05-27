@@ -15,8 +15,8 @@ export default function HeroSection({ onNavigate, onOpenAuth }: Props) {
           rcontrol
         </h1>
         <p className="mt-3 text-[14px] leading-relaxed text-[#555]">
-          Roblox Rivals meta tracker and config vault.{" "}
-          Browse weapon stats, loadouts, and rage configs.
+          Roblox Rivals meta tracker and config vault. Browse weapon stats,
+          loadouts, and rage configs.
         </p>
 
         <div className="mt-8 flex flex-wrap justify-center gap-2.5">
@@ -59,10 +59,13 @@ export default function HeroSection({ onNavigate, onOpenAuth }: Props) {
 
         {!user && (
           <p className="mt-8 text-[11px] text-[#444]">
-            <button onClick={() => onOpenAuth("login")} className="text-white hover:underline">
+            <button
+              onClick={() => onOpenAuth("login")}
+              className="text-white hover:underline"
+            >
               Sign in
-            </button>
-            {" "}to upload and download configs
+            </button>{" "}
+            to upload and download configs
           </p>
         )}
       </div>

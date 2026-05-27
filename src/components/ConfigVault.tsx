@@ -1,449 +1,457 @@
-import { useState, useEffect } from "react";
+import { useMemo, useState } from "react";
 import { useAuth } from "../auth";
-import type { Config, ConfigMode, SoftwareType, SortOption } from "../types";
-import ConfirmModal from "./ConfirmModal";
+import type {
+  Config,
+  ConfigMode,
+  SoftwareType,
+  SortOption,
+} from "../types";
+import { cn } from "../utils/cn";
 
 interface Props {
   onOpenAuth: (mode: "login" | "register") => void;
 }
 
+const softwareOptions: { value: SoftwareType; label: string }[] = [
+  { value: "kiciav3", label: "kiciav3" },
+  { value: "unnamed", label: "unnamed" },
+];
+
 const modes: ConfigMode[] = ["All", "FFA", "1v1", "2v2", "Ranked"];
-const softwareOptions: SoftwareType[] = ["kiciav3", "unnamed"];
 
-// ─── Upload Modal ─────────────────────────────────────────────────────────────
+export default function ConfigVault({ onOpenAuth }: Props) {
+  const { user, configs, settings, addConfig, voteConfig } = useAuth();
 
-interface UploadProps {
-  onClose: () => void;
-}
+  const [sort, setSort] = useState<SortOption>("popular");
+  const [modeFilter, setModeFilter] = useState<ConfigMode>("All");
+  const [softwareFilter, setSoftwareFilter] =
+    useState<SoftwareType | "all">("all");
+  const [search, setSearch] = useState("");
 
-function UploadModal({ onClose }: UploadProps) {
-  const { addConfig } = useAuth();
   const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [mode, setMode] = useState<ConfigMode>("All");
   const [software, setSoftware] = useState<SoftwareType>("kiciav3");
-  const [settings, setSettings] = useState("");
-  const [jsonContent, setJsonContent] = useState("");
-  const [filename, setFilename] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [mode, setMode] = useState<ConfigMode>("All");
+  const [description, setDescription] = useState("");
+  const [settingsText, setSettingsText] = useState("");
+  const [fileContent, setFileContent] = useState<string | undefined>();
+  const [filename, setFilename] = useState<string | undefined>();
+  const [submitting, setSubmitting] = useState(false);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  if (!settings.configsEnabled) {
+    return (
+      <div className="mx-auto max-w-3xl px-4 py-16 text-center text-[13px] text-[#555]">
+        Config vault is currently disabled.
+      </div>
+    );
+  }
+
+  const filteredConfigs = useMemo(() => {
+    let list = [...configs];
+
+    if (modeFilter !== "All") {
+      list = list.filter((c) => c.mode === modeFilter);
+    }
+
+    if (softwareFilter !== "all") {
+      list = list.filter((c) => c.software === softwareFilter);
+    }
+
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(
+        (c) =>
+          c.name.toLowerCase().includes(q) ||
+          c.description.toLowerCase().includes(q) ||
+          c.author.toLowerCase().includes(q)
+      );
+    }
+
+    if (sort === "popular") {
+      list.sort((a, b) => b.votes - a.votes);
+    } else {
+      list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    }
+
+    return list;
+  }, [configs, modeFilter, softwareFilter, search, sort]);
+
+  const handleFileChange: React.ChangeEventHandler<HTMLInputElement> = async (
+    e
+  ) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file) {
+      setFileContent(undefined);
+      setFilename(undefined);
+      return;
+    }
+
+    const text = await file.text();
+    setFileContent(text);
     setFilename(file.name);
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const content = ev.target?.result as string;
-      setJsonContent(content);
-      // Try to parse and extract settings
-      try {
-        const parsed = JSON.parse(content);
-        const extracted = Object.entries(parsed)
-          .slice(0, 8)
-          .map(([k, v]) => `${k}: ${JSON.stringify(v)}`);
-        setSettings(extracted.join("\n"));
-      } catch {
-        // Not JSON, treat as raw
-        setSettings(content.slice(0, 500));
-      }
-    };
-    reader.readAsText(file);
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit: React.FormEventHandler = async (e) => {
     e.preventDefault();
-    setError(null);
-    if (!name.trim()) return setError("Name is required");
-    if (name.trim().length > 40) return setError("Name too long (max 40 chars)");
+    if (!user) {
+      onOpenAuth("login");
+      return;
+    }
+    if (!name.trim()) return;
 
-    setLoading(true);
+    setSubmitting(true);
     try {
+      const settingsArr = settingsText
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
       await addConfig({
         name: name.trim(),
-        description: description.trim(),
-        mode,
         software,
-        settings: settings.split("\n").map(s => s.trim()).filter(Boolean),
-        filename: filename || undefined,
-        jsonContent: jsonContent || undefined,
+        mode,
+        description: description.trim(),
+        settings: settingsArr,
+        filename,
+        jsonContent: fileContent,
       });
-      onClose();
-    } catch {
-      setError("Failed to upload config");
+
+      setName("");
+      setDescription("");
+      setSettingsText("");
+      setFileContent(undefined);
+      setFilename(undefined);
     } finally {
-      setLoading(false);
+      setSubmitting(false);
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-md rounded-lg border border-white/[0.08] bg-[#0a0a0a] p-5 max-h-[90vh] overflow-y-auto">
-        <button
-          onClick={onClose}
-          className="absolute top-4 right-4 text-[#444] transition-colors hover:text-white"
-        >
-          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        </button>
+  const handleVote = (cfg: Config) => {
+    if (!user) {
+      onOpenAuth("login");
+      return;
+    }
+    voteConfig(cfg.id);
+  };
 
-        <div className="mb-5">
-          <h2 className="text-[14px] font-medium text-white">Upload Config</h2>
-          <p className="mt-1 text-[11px] text-[#555]">Share your rage config</p>
-        </div>
+  const handleDownload = (cfg: Config) => {
+    const content =
+      cfg.jsonContent ||
+      JSON.stringify({
+        name: cfg.name,
+        software: cfg.software,
+        mode: cfg.mode,
+        settings: cfg.settings,
+      }, null, 2);
 
-        <form onSubmit={handleSubmit} className="space-y-3">
-          {/* Name */}
-          <div>
-            <label className="mb-1 block text-[10px] text-[#666]">Config Name</label>
-            <input
-              type="text"
-              value={name}
-              onChange={e => setName(e.target.value)}
-              className="w-full rounded-md border border-white/[0.08] bg-transparent px-3 py-2 text-[13px] text-white outline-none placeholder:text-[#333] focus:border-white/20"
-              placeholder="My rage config"
-              disabled={loading}
-            />
-          </div>
-
-          {/* Software */}
-          <div>
-            <label className="mb-1 block text-[10px] text-[#666]">Software</label>
-            <div className="flex gap-1.5">
-              {softwareOptions.map(opt => (
-                <button
-                  key={opt}
-                  type="button"
-                  onClick={() => setSoftware(opt)}
-                  className={`rounded-md px-3 py-1.5 text-[11px] transition-colors ${
-                    software === opt ? "bg-white text-black" : "border border-white/[0.08] text-[#555] hover:text-white"
-                  }`}
-                >
-                  {opt}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Mode */}
-          <div>
-            <label className="mb-1 block text-[10px] text-[#666]">Mode</label>
-            <div className="flex flex-wrap gap-1.5">
-              {modes.map(m => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setMode(m)}
-                  className={`rounded-md px-2.5 py-1.5 text-[11px] transition-colors ${
-                    mode === m ? "bg-white text-black" : "border border-white/[0.08] text-[#555] hover:text-white"
-                  }`}
-                >
-                  {m}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Description */}
-          <div>
-            <label className="mb-1 block text-[10px] text-[#666]">Description</label>
-            <textarea
-              value={description}
-              onChange={e => setDescription(e.target.value)}
-              rows={2}
-              className="w-full rounded-md border border-white/[0.08] bg-transparent px-3 py-2 text-[13px] text-white outline-none placeholder:text-[#333] focus:border-white/20 resize-none"
-              placeholder="Brief description..."
-              disabled={loading}
-            />
-          </div>
-
-          {/* File upload */}
-          <div>
-            <label className="mb-1 block text-[10px] text-[#666]">Config File (optional)</label>
-            <label className="flex cursor-pointer items-center gap-2 rounded-md border border-white/[0.08] px-3 py-2 text-[12px] text-[#555] hover:border-white/20 hover:text-white transition-colors">
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-              </svg>
-              {filename ? filename : "Upload .json / .cfg file"}
-              <input type="file" accept=".json,.cfg,.txt" onChange={handleFileUpload} className="sr-only" disabled={loading} />
-            </label>
-          </div>
-
-          {/* Manual settings */}
-          <div>
-            <label className="mb-1 block text-[10px] text-[#666]">Settings Preview (auto-filled from file or enter manually)</label>
-            <textarea
-              value={settings}
-              onChange={e => setSettings(e.target.value)}
-              rows={4}
-              className="w-full rounded-md border border-white/[0.08] bg-transparent px-3 py-2 font-mono text-[11px] text-[#888] outline-none placeholder:text-[#333] focus:border-white/20 resize-none"
-              placeholder={"FOV: 90\nSensitivity: 1.2\n..."}
-              disabled={loading}
-            />
-          </div>
-
-          {error && <p className="text-[11px] text-red-400">{error}</p>}
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="mt-1 w-full rounded-md bg-white py-2 text-[12px] font-medium text-black transition-colors hover:bg-white/90 disabled:opacity-50"
-          >
-            {loading ? "Uploading..." : "Upload Config"}
-          </button>
-        </form>
-      </div>
-    </div>
-  );
-}
-
-// ─── Config Card ─────────────────────────────────────────────────────────────
-
-interface CardProps {
-  config: Config;
-  onVote: () => void;
-  onDelete?: () => void;
-  canVote: boolean;
-}
-
-function ConfigCard({ config, onVote, onDelete, canVote }: CardProps) {
-  const handleDownload = () => {
-    if (!config.jsonContent && !config.settings.length) return;
-    const content = config.jsonContent || config.settings.join("\n");
     const blob = new Blob([content], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = config.filename || `${config.name.replace(/\s+/g, "_")}.json`;
+    a.download = cfg.filename || `${cfg.name}.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
   return (
-    <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] p-4 transition-colors hover:border-white/[0.1]">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[13px] font-medium text-white">{config.name}</span>
-            <span className="rounded bg-white/[0.05] px-1.5 py-0.5 text-[9px] text-[#555]">{config.software}</span>
-            <span className="rounded bg-white/[0.05] px-1.5 py-0.5 text-[9px] text-[#555]">{config.mode}</span>
-          </div>
-          <p className="mt-1 text-[11px] text-[#555]">
-            by{" "}
-            <span className="text-[#888]">{config.author}</span>
-            <span className="ml-2 text-[#333]">{config.createdAt}</span>
+    <div className="mx-auto max-w-4xl px-4 py-8">
+      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-[18px] font-medium text-white">Config Vault</h1>
+          <p className="mt-1 text-[12px] text-[#555]">
+            Share and download Roblox Rivals rage configs.
           </p>
-          {config.description && (
-            <p className="mt-1.5 text-[11px] leading-relaxed text-[#666]">{config.description}</p>
-          )}
         </div>
-
-        <div className="flex flex-shrink-0 items-center gap-2">
-          {(config.jsonContent || config.settings.length > 0) && (
-            <button
-              onClick={handleDownload}
-              title="Download config"
-              className="flex items-center gap-1 rounded-md border border-white/[0.08] px-2 py-1.5 text-[10px] text-[#555] transition-colors hover:border-white/20 hover:text-white"
-            >
-              <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              {config.filename ? config.filename.split(".").pop() : "dl"}
-            </button>
-          )}
-
-          <button
-            onClick={canVote ? onVote : undefined}
-            className={`flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[11px] transition-colors ${
-              config.voted
-                ? "border-white/20 text-white"
-                : canVote
-                ? "border-white/[0.06] text-[#555] hover:border-white/20 hover:text-white"
-                : "border-white/[0.04] text-[#333] cursor-default"
-            }`}
-          >
-            <span>{config.voted ? "▲" : "△"}</span>
-            <span>{config.votes}</span>
-          </button>
-
-          {onDelete && (
-            <button
-              onClick={onDelete}
-              className="rounded-md border border-white/[0.06] px-2 py-1.5 text-[10px] text-[#444] transition-colors hover:border-red-500/30 hover:text-red-400"
-            >
-              del
-            </button>
-          )}
+        <div className="flex gap-2 text-[11px] text-[#444]">
+          <span>{configs.length} configs</span>
         </div>
       </div>
 
-      {config.settings.length > 0 && (
-        <div className="mt-3 rounded-md bg-white/[0.02] p-2.5">
-          <div className="flex flex-wrap gap-x-4 gap-y-1">
-            {config.settings.slice(0, 6).map((s, i) => (
-              <span key={i} className="font-mono text-[10px] text-[#555]">{s}</span>
-            ))}
-            {config.settings.length > 6 && (
-              <span className="text-[10px] text-[#333]">+{config.settings.length - 6} more</span>
+      {/* Filters */}
+      <div className="mb-6 flex flex-wrap items-center gap-2 text-[11px]">
+        <div className="flex gap-1">
+          <button
+            onClick={() => setSort("popular")}
+            className={cn(
+              "rounded-md px-2.5 py-1",
+              sort === "popular"
+                ? "bg-white text-black"
+                : "text-[#555] hover:text-white"
             )}
-          </div>
+          >
+            Popular
+          </button>
+          <button
+            onClick={() => setSort("newest")}
+            className={cn(
+              "rounded-md px-2.5 py-1",
+              sort === "newest"
+                ? "bg-white text-black"
+                : "text-[#555] hover:text-white"
+            )}
+          >
+            Newest
+          </button>
         </div>
-      )}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            value={modeFilter}
+            onChange={(e) => setModeFilter(e.target.value as ConfigMode)}
+            className="rounded-md border border-white/[0.08] bg-black/40 px-2 py-1 text-[11px] text-white outline-none"
+          >
+            {modes.map((m) => (
+              <option key={m} value={m} className="bg-black">
+                Mode: {m}
+              </option>
+            ))}
+          </select>
+
+          <select
+            value={softwareFilter}
+            onChange={(e) =>
+              setSoftwareFilter(e.target.value as SoftwareType | "all")
+            }
+            className="rounded-md border border-white/[0.08] bg-black/40 px-2 py-1 text-[11px] text-white outline-none"
+          >
+            <option value="all" className="bg-black">
+              Software: All
+            </option>
+            {softwareOptions.map((opt) => (
+              <option
+                key={opt.value}
+                value={opt.value}
+                className="bg-black"
+              >
+                Software: {opt.label}
+              </option>
+            ))}
+          </select>
+
+          <input
+            type="text"
+            placeholder="Search configs..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="min-w-[160px] flex-1 rounded-md border border-white/[0.08] bg-black/40 px-2 py-1 text-[11px] text-white outline-none placeholder:text-[#333]"
+          />
+        </div>
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,2fr)_minmax(0,1.2fr)]">
+        {/* Config list */}
+        <div className="space-y-3">
+          {filteredConfigs.map((cfg) => (
+            <ConfigCard
+              key={cfg.id}
+              cfg={cfg}
+              onVote={() => handleVote(cfg)}
+              onDownload={() => handleDownload(cfg)}
+            />
+          ))}
+          {filteredConfigs.length === 0 && (
+            <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] p-4 text-center text-[12px] text-[#555]">
+              No configs match your filters.
+            </div>
+          )}
+        </div>
+
+        {/* Submit form */}
+        <div className="h-max rounded-lg border border-white/[0.06] bg-white/[0.01] p-4">
+          <h2 className="mb-3 text-[13px] font-medium text-white">
+            {user ? "Upload Config" : "Sign in to upload"}
+          </h2>
+
+          <form onSubmit={handleSubmit} className="space-y-3 text-[11px]">
+            {/* Name */}
+            <div>
+              <label className="mb-1 block text-[10px] text-[#666]">
+                Config Name
+              </label>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                className="w-full rounded-md border border-white/[0.08] bg-transparent px-3 py-2 text-[13px] text-white outline-none placeholder:text-[#333] focus:border-white/20"
+                placeholder="My rage config"
+                disabled={submitting}
+              />
+            </div>
+
+            {/* Software */}
+            <div>
+              <label className="mb-1 block text-[10px] text-[#666]">
+                Software
+              </label>
+              <select
+                value={software}
+                onChange={(e) =>
+                  setSoftware(e.target.value as SoftwareType)
+                }
+                className="w-full rounded-md border border-white/[0.08] bg-black/40 px-3 py-2 text-[12px] text-white outline-none"
+                disabled={submitting}
+              >
+                {softwareOptions.map((opt) => (
+                  <option
+                    key={opt.value}
+                    value={opt.value}
+                    className="bg-black"
+                  >
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Mode */}
+            <div>
+              <label className="mb-1 block text-[10px] text-[#666]">
+                Mode
+              </label>
+              <select
+                value={mode}
+                onChange={(e) => setMode(e.target.value as ConfigMode)}
+                className="w-full rounded-md border border-white/[0.08] bg-black/40 px-3 py-2 text-[12px] text-white outline-none"
+                disabled={submitting}
+              >
+                {modes.map((m) => (
+                  <option key={m} value={m} className="bg-black">
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Description */}
+            <div>
+              <label className="mb-1 block text-[10px] text-[#666]">
+                Description
+              </label>
+              <textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={2}
+                className="w-full rounded-md border border-white/[0.08] bg-transparent px-3 py-2 text-[12px] text-white outline-none placeholder:text-[#333] focus:border-white/20 resize-none"
+                placeholder="What this config is for, strengths, notes..."
+                disabled={submitting}
+              />
+            </div>
+
+            {/* Settings list */}
+            <div>
+              <label className="mb-1 block text-[10px] text-[#666]">
+                Settings (one per line)
+              </label>
+              <textarea
+                value={settingsText}
+                onChange={(e) => setSettingsText(e.target.value)}
+                rows={3}
+                className="w-full rounded-md border border-white/[0.08] bg-transparent px-3 py-2 text-[12px] text-white outline-none placeholder:text-[#333] focus:border-white/20"
+                placeholder="aimbot fov: 3.5
+smoothness: 0.25
+agebot: enabled"
+                disabled={submitting}
+              />
+            </div>
+
+            {/* File upload */}
+            <div>
+              <label className="mb-1 block text-[10px] text-[#666]">
+                Optional JSON file
+              </label>
+              <input
+                type="file"
+                accept=".json,.txt"
+                onChange={handleFileChange}
+                className="block w-full text-[11px] text-[#555] file:mr-2 file:rounded-md file:border-0 file:bg-white/5 file:px-2 file:py-1 file:text-[11px] file:text-white hover:file:bg-white/10"
+                disabled={submitting}
+              />
+              {filename && (
+                <div className="mt-1 text-[10px] text-[#555]">
+                  Attached: {filename}
+                </div>
+              )}
+            </div>
+
+            <button
+              type="submit"
+              disabled={submitting}
+              className="mt-1 w-full rounded-md bg-white py-2 text-[12px] font-medium text-black transition-colors hover:bg-white/90 disabled:opacity-50"
+            >
+              {submitting ? "Uploading..." : "Submit Config"}
+            </button>
+
+            {!user && (
+              <p className="mt-2 text-[10px] text-[#555]">
+                You need an account to upload configs.
+              </p>
+            )}
+          </form>
+        </div>
+      </div>
     </div>
   );
 }
 
-// ─── Config Vault ─────────────────────────────────────────────────────────────
-
-export default function ConfigVault({ onOpenAuth }: Props) {
-  const { user, configs, settings, voteConfig, deleteConfig, isAdmin, refreshConfigs } = useAuth();
-  const [modeFilter, setModeFilter] = useState<ConfigMode | "All">("All");
-  const [softwareFilter, setSoftwareFilter] = useState<SoftwareType | "all">("all");
-  const [sort, setSort] = useState<SortOption>("popular");
-  const [showUpload, setShowUpload] = useState(false);
-  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
-
-  // Refresh configs when component mounts
-  useEffect(() => {
-    refreshConfigs();
-  }, []);
-
-  const filtered = configs
-    .filter(c => modeFilter === "All" || c.mode === modeFilter)
-    .filter(c => softwareFilter === "all" || c.software === softwareFilter)
-    .sort((a, b) =>
-      sort === "popular"
-        ? b.votes - a.votes
-        : b.createdAt.localeCompare(a.createdAt)
-    );
-
+function ConfigCard({
+  cfg,
+  onVote,
+  onDownload,
+}: {
+  cfg: Config;
+  onVote: () => void;
+  onDownload: () => void;
+}) {
   return (
-    <div className="mx-auto max-w-3xl px-4 py-8">
-      {/* Header */}
-      <div className="mb-6 flex items-start justify-between">
+    <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] p-4">
+      <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-[18px] font-medium text-white">Config Vault</h1>
-          <p className="mt-0.5 text-[12px] text-[#555]">
-            Rage configs for kiciav3 &amp; unnamed enhancements
-          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-[13px] font-medium text-white">{cfg.name}</h2>
+            <span className="rounded bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-[#888]">
+              {cfg.software} · {cfg.mode}
+            </span>
+          </div>
+          <p className="mt-1 text-[11px] text-[#555]">{cfg.description}</p>
         </div>
-        {settings.configsEnabled && user && (
-          <button
-            onClick={() => setShowUpload(true)}
-            className="rounded-md bg-white px-3 py-1.5 text-[12px] font-medium text-black transition-colors hover:bg-white/90"
-          >
-            Upload
-          </button>
-        )}
+
+        <button
+          onClick={onVote}
+          className={cn(
+            "flex flex-col items-center rounded-md border px-2 py-1 text-[10px] transition-colors",
+            cfg.voted
+              ? "border-green-500/40 bg-green-500/10 text-green-300"
+              : "border-white/10 bg-black/40 text-[#777] hover:border-white/30 hover:text-white"
+          )}
+        >
+          <span>{cfg.votes}</span>
+          <span>{cfg.voted ? "Voted" : "Upvote"}</span>
+        </button>
       </div>
 
-      {!settings.configsEnabled ? (
-        <div className="rounded-lg border border-white/[0.06] p-8 text-center text-[13px] text-[#444]">
-          Config vault is currently disabled
+      {cfg.settings.length > 0 && (
+        <div className="mt-3 grid gap-1 text-[10px] text-[#666] sm:grid-cols-2">
+          {cfg.settings.map((s, i) => (
+            <div key={i} className="truncate">
+              • {s}
+            </div>
+          ))}
         </div>
-      ) : (
-        <>
-          {/* Filters */}
-          <div className="mb-5 space-y-2">
-            {/* Row 1: mode + sort */}
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex flex-wrap gap-1">
-                {(["All", ...modes.filter(m => m !== "All")] as (ConfigMode | "All")[]).map(m => (
-                  <button
-                    key={m}
-                    onClick={() => setModeFilter(m)}
-                    className={`rounded-md px-2.5 py-1.5 text-[11px] transition-colors ${
-                      modeFilter === m ? "bg-white text-black" : "text-[#555] hover:text-white"
-                    }`}
-                  >
-                    {m}
-                  </button>
-                ))}
-              </div>
-              <div className="ml-auto flex items-center gap-1 text-[11px] text-[#444]">
-                <span>/</span>
-                <select
-                  value={sort}
-                  onChange={e => setSort(e.target.value as SortOption)}
-                  className="bg-transparent text-[#555] outline-none hover:text-white cursor-pointer"
-                >
-                  <option value="popular">Popular</option>
-                  <option value="newest">Newest</option>
-                </select>
-              </div>
-            </div>
+      )}
 
-            {/* Row 2: software filter */}
-            <div className="flex items-center gap-1.5 text-[11px]">
-              <span className="text-[#444]">Software</span>
-              <button
-                onClick={() => setSoftwareFilter("all")}
-                className={`rounded-md px-2 py-1 text-[10px] transition-colors ${
-                  softwareFilter === "all" ? "text-white" : "text-[#444] hover:text-white"
-                }`}
-              >
-                All
-              </button>
-              {softwareOptions.map(opt => (
-                <button
-                  key={opt}
-                  onClick={() => setSoftwareFilter(opt)}
-                  className={`rounded-md px-2 py-1 text-[10px] transition-colors ${
-                    softwareFilter === opt ? "text-white" : "text-[#444] hover:text-white"
-                  }`}
-                >
-                  {opt}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {filtered.length === 0 ? (
-            <div className="rounded-lg border border-white/[0.04] py-16 text-center">
-              <div className="mb-2 text-[24px] text-[#222]">○</div>
-              <div className="text-[13px] text-[#555]">No configs yet</div>
-              <p className="mt-1 text-[11px] text-[#333]">
-                Be the first to share a config.
-              </p>
-              {!user && (
-                <button
-                  onClick={() => onOpenAuth("register")}
-                  className="mt-4 rounded-md border border-white/[0.08] px-4 py-2 text-[12px] text-white hover:bg-white/[0.04]"
-                >
-                  Sign up to upload
-                </button>
-              )}
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {filtered.map(c => (
-                <ConfigCard
-                  key={c.id}
-                  config={c}
-                  onVote={() => voteConfig(c.id)}
-                  onDelete={isAdmin ? () => setDeleteTarget({ id: c.id, name: c.name }) : undefined}
-                  canVote={!!user}
-                />
-              ))}
-            </div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[10px] text-[#444]">
+        <span>
+          by {cfg.author} · {cfg.createdAt}
+        </span>
+        <div className="flex gap-2">
+          {cfg.jsonContent && (
+            <button
+              onClick={onDownload}
+              className="text-[#555] hover:text-white"
+            >
+              Download JSON
+            </button>
           )}
-        </>
-      )}
-
-      {showUpload && <UploadModal onClose={() => setShowUpload(false)} />}
-
-      {deleteTarget && (
-        <ConfirmModal
-          title="Delete Config"
-          message={`Delete "${deleteTarget.name}"? This cannot be undone.`}
-          confirmLabel="Delete"
-          danger
-          onConfirm={() => { deleteConfig(deleteTarget.id); setDeleteTarget(null); }}
-          onCancel={() => setDeleteTarget(null)}
-        />
-      )}
+        </div>
+      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AuthProvider, useAuth } from "./auth";
 import AuthPage from "./pages/AuthPage";
 import AdminPanel from "./pages/AdminPanel";
@@ -12,7 +12,9 @@ function AppContent() {
   const { isAdmin, loading } = useAuth();
   const [visible, setVisible] = useState(true);
   const [displayPage, setDisplayPage] = useState("home");
-  const [authModal, setAuthModal] = useState<"login" | "register" | null>(null);
+  const [authModal, setAuthModal] = useState<"login" | "register" | null>(
+    null
+  );
   const timeoutRef = useRef<number | undefined>(undefined);
 
   const navigate = (next: string) => {
@@ -30,7 +32,9 @@ function AppContent() {
   const openAuth = (mode: "login" | "register") => setAuthModal(mode);
   const closeAuth = () => setAuthModal(null);
 
-  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+  useEffect(() => {
+    return () => window.clearTimeout(timeoutRef.current);
+  }, []);
 
   if (loading) {
     return (
@@ -49,17 +53,27 @@ function AppContent() {
 
       {/* content */}
       <div className="relative z-10 flex min-h-screen flex-col">
-        <Navbar page={displayPage} onNavigate={navigate} onOpenAuth={openAuth} />
+        <Navbar
+          page={displayPage}
+          onNavigate={navigate}
+          onOpenAuth={openAuth}
+        />
 
         <main className="flex-1 pt-12">
           <div
             className={`transition-all duration-200 ease-out ${
-              visible ? "translate-y-0 opacity-100" : "translate-y-1 opacity-0"
+              visible
+                ? "translate-y-0 opacity-100"
+                : "translate-y-1 opacity-0"
             }`}
           >
-            {displayPage === "home" && <HeroSection onNavigate={navigate} onOpenAuth={openAuth} />}
+            {displayPage === "home" && (
+              <HeroSection onNavigate={navigate} onOpenAuth={openAuth} />
+            )}
             {displayPage === "meta" && <MetaDashboard />}
-            {displayPage === "configs" && <ConfigVault onOpenAuth={openAuth} />}
+            {displayPage === "configs" && (
+              <ConfigVault onOpenAuth={openAuth} />
+            )}
             {displayPage === "admin" && isAdmin && <AdminPanel />}
           </div>
         </main>
@@ -68,7 +82,9 @@ function AppContent() {
       </div>
 
       {/* auth modal */}
-      {authModal && <AuthPage onClose={closeAuth} initialMode={authModal} />}
+      {authModal && (
+        <AuthPage onClose={closeAuth} initialMode={authModal} />
+      )}
     </div>
   );
 }

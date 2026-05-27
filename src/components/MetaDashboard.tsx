@@ -1,6 +1,12 @@
 import { useState } from "react";
 import type { GameMode } from "../types";
-import { weapons, usageChartData, weeklyTrendData, trendingSetups, patchChanges } from "../data";
+import {
+  weapons,
+  usageChartData,
+  weeklyTrendData,
+  trendingSetups,
+  patchChanges,
+} from "../data";
 import WeaponTierList from "./WeaponTierList";
 import UsageChart from "./UsageChart";
 import TrendChart from "./TrendChart";

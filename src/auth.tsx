@@ -1,12 +1,12 @@
 import {
   createContext,
-  useContext,
-  useState,
   useCallback,
+  useContext,
   useEffect,
-  useRef,
+  useState,
   type ReactNode,
 } from "react";
+import { supabase } from "./supabaseClient";
 import type { Config, SiteSettings } from "./types";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -39,7 +39,12 @@ interface AuthState {
   unbanUser: (id: string) => Promise<void>;
   deleteUser: (id: string) => Promise<void>;
   updateSettings: (s: Partial<SiteSettings>) => Promise<void>;
-  addConfig: (config: Omit<Config, "id" | "author" | "authorId" | "votes" | "createdAt" | "voted">) => Promise<void>;
+  addConfig: (
+    config: Omit<
+      Config,
+      "id" | "author" | "authorId" | "votes" | "createdAt" | "voted"
+    >
+  ) => Promise<void>;
   voteConfig: (id: string) => Promise<void>;
   deleteConfig: (id: string) => Promise<void>;
   refreshConfigs: () => Promise<void>;
@@ -48,89 +53,10 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState | null>(null);
 
-// ─── API Base URL ─────────────────────────────────────────────────────────────
-// Since this is a static Vite build without a server, we use a self-contained
-// approach: IndexedDB for persistence + BroadcastChannel for cross-tab sync.
-// This gives real "server-like" behaviour: all tabs/windows share the same data
-// and changes propagate in real time.
-
-// ─── IndexedDB helpers ───────────────────────────────────────────────────────
-
-const DB_NAME = "rcontrol_db";
-const DB_VERSION = 3;
-
-type StoreNames = "users" | "configs" | "settings" | "passwords" | "meta" | "votes";
-
-function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains("users"))
-        db.createObjectStore("users", { keyPath: "id" });
-      if (!db.objectStoreNames.contains("configs"))
-        db.createObjectStore("configs", { keyPath: "id" });
-      if (!db.objectStoreNames.contains("settings"))
-        db.createObjectStore("settings", { keyPath: "key" });
-      if (!db.objectStoreNames.contains("passwords"))
-        db.createObjectStore("passwords", { keyPath: "username" });
-      if (!db.objectStoreNames.contains("meta"))
-        db.createObjectStore("meta", { keyPath: "key" });
-      if (!db.objectStoreNames.contains("votes"))
-        db.createObjectStore("votes", { keyPath: "id" });
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function dbGetAll<T>(store: StoreNames): Promise<T[]> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readonly");
-    const req = tx.objectStore(store).getAll();
-    req.onsuccess = () => resolve(req.result as T[]);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function dbGet<T>(store: StoreNames, key: string): Promise<T | undefined> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readonly");
-    const req = tx.objectStore(store).get(key);
-    req.onsuccess = () => resolve(req.result as T | undefined);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function dbPut(store: StoreNames, value: unknown): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readwrite");
-    const req = tx.objectStore(store).put(value);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function dbDelete(store: StoreNames, key: string): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, "readwrite");
-    const req = tx.objectStore(store).delete(key);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
-  });
-}
-
-// ─── Simple ID generator ─────────────────────────────────────────────────────
-
-function genId(): string {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
-// ─── Default settings ────────────────────────────────────────────────────────
+// We treat usernames as synthetic emails in Supabase auth so that the
+// UI can stay "username + password" while Supabase still uses email fields.
+const APP_EMAIL_DOMAIN = "@rcontrol.local";
+const toEmail = (username: string) => `${username}${APP_EMAIL_DOMAIN}`;
 
 const defaultSettings: SiteSettings = {
   announcement: "",
@@ -138,11 +64,18 @@ const defaultSettings: SiteSettings = {
   registrationOpen: true,
 };
 
-// ─── BroadcastChannel for cross-tab sync ─────────────────────────────────────
-
-const SYNC_CHANNEL = "rcontrol_sync";
-
-// ─── AuthProvider ─────────────────────────────────────────────────────────────
+function mapProfile(row: any): User {
+  return {
+    id: row.id,
+    username: row.username,
+    joinedAt: (row.joined_at ?? row.created_at ?? new Date().toISOString()).slice(
+      0,
+      10
+    ),
+    banned: Boolean(row.banned),
+    role: (row.role as User["role"]) ?? "user",
+  };
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
@@ -150,315 +83,607 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [configs, setConfigs] = useState<Config[]>([]);
   const [settings, setSettings] = useState<SiteSettings>(defaultSettings);
   const [loading, setLoading] = useState(true);
-  const channelRef = useRef<BroadcastChannel | null>(null);
+  const [ownerId, setOwnerId] = useState<string | null>(null);
+  const [adminIds, setAdminIds] = useState<string[]>([]);
 
-  // Broadcast a sync event to other tabs
-  const broadcast = useCallback((type: string) => {
-    try {
-      channelRef.current?.postMessage({ type });
-    } catch {}
-  }, []);
-
-  // ── Load from IndexedDB ──────────────────────────────────────────────────
+  // ── Load helpers ──────────────────────────────────────────────────────────
 
   const loadUsers = useCallback(async () => {
-    const all = await dbGetAll<User>("users");
-    setUsers(all);
-    return all;
-  }, []);
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, username, joined_at, banned, role")
+      .order("joined_at", { ascending: true });
 
-  const loadConfigs = useCallback(async () => {
-    // Load votes for current user from session
-    const sessionUserId = sessionStorage.getItem("rc_user_id");
-    const all = await dbGetAll<Config & { id: string }>("configs");
-    const votes = sessionUserId
-      ? await dbGetAll<{ id: string; userId: string; configId: string }>("votes")
-      : [];
-    const userVotes = new Set(votes.filter(v => v.userId === sessionUserId).map(v => v.configId));
-    const withVoted = all.map(c => ({ ...c, voted: userVotes.has(c.id) }));
-    // Sort by date descending
-    withVoted.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    setConfigs(withVoted);
+    if (error) {
+      console.error("[rcontrol] loadUsers error", error);
+      setUsers([]);
+      setOwnerId(null);
+      setAdminIds([]);
+      return [] as User[];
+    }
+
+    const mapped = (data ?? []).map(mapProfile);
+    setUsers(mapped);
+
+    const owner = mapped.find((u) => u.role === "owner") ?? null;
+    setOwnerId(owner?.id ?? null);
+    setAdminIds(mapped.filter((u) => u.role === "admin").map((u) => u.id));
+
+    return mapped;
   }, []);
 
   const loadSettings = useCallback(async () => {
-    const pairs = await dbGetAll<{ key: string; value: unknown }>("settings");
-    const merged: Record<string, unknown> = { ...defaultSettings };
-    for (const p of pairs) merged[p.key] = p.value;
-    setSettings(merged as unknown as SiteSettings);
+    const { data, error } = await supabase
+      .from("site_settings")
+      .select("key, value");
+
+    if (error) {
+      console.error("[rcontrol] loadSettings error", error);
+      setSettings(defaultSettings);
+      return;
+    }
+
+    const merged: SiteSettings = { ...defaultSettings };
+    (data ?? []).forEach((row: any) => {
+      if (row.key in merged) {
+        (merged as any)[row.key] = row.value;
+      }
+    });
+    setSettings(merged);
   }, []);
 
-  const loadMeta = useCallback(async (): Promise<{
-    ownerId: string | null;
-    adminIds: string[];
-  }> => {
-    const ownerRec = await dbGet<{ key: string; value: string | null }>("meta", "ownerId");
-    const adminRec = await dbGet<{ key: string; value: string[] }>("meta", "adminIds");
-    return {
-      ownerId: ownerRec?.value ?? null,
-      adminIds: adminRec?.value ?? [],
-    };
+  const loadConfigs = useCallback(
+    async (currentUserId?: string | null) => {
+      const activeUserId = currentUserId ?? user?.id ?? null;
+
+      const { data, error } = await supabase
+        .from("configs")
+        .select(
+          "id, name, author_id, author_name, mode, software, description, settings, votes, created_at, filename, json_content"
+        )
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("[rcontrol] loadConfigs error", error);
+        setConfigs([]);
+        return;
+      }
+
+      let votedIds = new Set<string>();
+      if (activeUserId) {
+        const { data: votesData, error: votesError } = await supabase
+          .from("config_votes")
+          .select("config_id")
+          .eq("user_id", activeUserId);
+
+        if (!votesError && votesData) {
+          votedIds = new Set(votesData.map((v: any) => v.config_id));
+        }
+      }
+
+      const mapped: Config[] = (data ?? []).map((row: any) => ({
+        id: row.id,
+        name: row.name,
+        authorId: row.author_id,
+        author: row.author_name,
+        mode: row.mode,
+        software: row.software,
+        description: row.description,
+        settings: row.settings ?? [],
+        votes: row.votes ?? 0,
+        createdAt: (row.created_at ?? "").slice(0, 10),
+        voted: activeUserId ? votedIds.has(row.id) : false,
+        filename: row.filename ?? undefined,
+        jsonContent: row.json_content ?? undefined,
+      }));
+
+      setConfigs(mapped);
+    },
+    [user]
+  );
+
+  const loadCurrentUser = useCallback(async (): Promise<User | null> => {
+    const { data: sessionData, error: sessionError } =
+      await supabase.auth.getSession();
+    if (sessionError) {
+      console.error("[rcontrol] getSession error", sessionError);
+      setUser(null);
+      return null;
+    }
+
+    const session = sessionData.session;
+    if (!session) {
+      setUser(null);
+      return null;
+    }
+
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, username, joined_at, banned, role")
+      .eq("id", session.user.id)
+      .maybeSingle();
+
+    if (error || !data) {
+      console.error("[rcontrol] loadCurrentUser profile error", error);
+      setUser(null);
+      return null;
+    }
+
+    const profile = mapProfile(data);
+    if (profile.banned) {
+      await supabase.auth.signOut().catch(() => {});
+      setUser(null);
+      return null;
+    }
+
+    setUser(profile);
+    return profile;
   }, []);
 
-  const [ownerId, setOwnerIdState] = useState<string | null>(null);
-  const [adminIds, setAdminIdsState] = useState<string[]>([]);
-
-  const refreshAll = useCallback(async () => {
-    const [allUsers, meta] = await Promise.all([
-      dbGetAll<User>("users"),
-      loadMeta(),
-    ]);
-    setUsers(allUsers);
-    setOwnerIdState(meta.ownerId);
-    setAdminIdsState(meta.adminIds);
-    await loadConfigs();
-    await loadSettings();
-  }, [loadMeta, loadConfigs, loadSettings]);
-
-  // ── Init ─────────────────────────────────────────────────────────────────
-
+  // Initial load
   useEffect(() => {
     (async () => {
       setLoading(true);
       try {
-        // Restore session
-        const savedId = sessionStorage.getItem("rc_user_id");
-        const allUsers = await dbGetAll<User>("users");
-        setUsers(allUsers);
-
-        const meta = await loadMeta();
-        setOwnerIdState(meta.ownerId);
-        setAdminIdsState(meta.adminIds);
-
-        if (savedId) {
-          const found = allUsers.find(u => u.id === savedId);
-          if (found && !found.banned) setUser(found);
-          else sessionStorage.removeItem("rc_user_id");
-        }
-
-        await loadConfigs();
-        await loadSettings();
+        const profile = await loadCurrentUser();
+        await Promise.all([
+          loadUsers(),
+          loadSettings(),
+          loadConfigs(profile?.id),
+        ]);
       } finally {
         setLoading(false);
       }
     })();
-  }, [loadMeta, loadConfigs, loadSettings]);
-
-  // ── Cross-tab sync ────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    try {
-      const ch = new BroadcastChannel(SYNC_CHANNEL);
-      channelRef.current = ch;
-      ch.onmessage = (e) => {
-        if (e.data?.type) refreshAll();
-      };
-      return () => { ch.close(); channelRef.current = null; };
-    } catch {
-      return () => {};
-    }
-  }, [refreshAll]);
+  }, [loadCurrentUser, loadUsers, loadSettings, loadConfigs]);
 
   // ── Auth actions ──────────────────────────────────────────────────────────
 
-  const login = useCallback(async (username: string, password: string): Promise<string | null> => {
-    const uname = username.trim().toLowerCase();
-    if (!uname || !password) return "Enter username and password";
+  const login = useCallback(
+    async (username: string, password: string): Promise<string | null> => {
+      const uname = username.trim().toLowerCase();
+      if (!uname || !password) return "Enter username and password";
 
-    const pwRec = await dbGet<{ username: string; password: string }>("passwords", uname);
-    if (!pwRec) return "Account not found";
-    if (pwRec.password !== password) return "Incorrect password";
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: toEmail(uname),
+        password,
+      });
 
-    const allUsers = await dbGetAll<User>("users");
-    const u = allUsers.find(u => u.username === uname);
-    if (!u) return "Account not found";
-    if (u.banned) return "Account suspended";
+      if (error || !data.session) {
+        return "Invalid username or password";
+      }
 
-    sessionStorage.setItem("rc_user_id", u.id);
-    setUser(u);
-    await loadConfigs(); // reload so votes are correct for this user
-    return null;
-  }, [loadConfigs]);
+      const profile = await loadCurrentUser();
+      if (!profile) {
+        return "Account not found or suspended";
+      }
 
-  const register = useCallback(async (username: string, password: string): Promise<string | null> => {
-    const settingRec = await dbGet<{ key: string; value: boolean }>("settings", "registrationOpen");
-    const regOpen = settingRec !== undefined ? settingRec.value : true;
-    const ownerRec = await dbGet<{ key: string; value: string | null }>("meta", "ownerId");
-    if (!regOpen && ownerRec?.value !== null) return "Registration is closed";
+      await Promise.all([
+        loadUsers(),
+        loadSettings(),
+        loadConfigs(profile.id),
+      ]);
 
-    const uname = username.trim().toLowerCase();
-    if (!uname || !password) return "Enter username and password";
-    if (uname.length < 2 || uname.length > 20) return "Username must be 2-20 chars";
-    if (!/^[a-z0-9_]+$/.test(uname)) return "Letters, numbers, underscores only";
-    if (password.length < 6) return "Password must be at least 6 chars";
+      return null;
+    },
+    [loadCurrentUser, loadUsers, loadSettings, loadConfigs]
+  );
 
-    // Check duplicate
-    const existing = await dbGet<{ username: string }>("passwords", uname);
-    if (existing) return "Username already taken";
+  const register = useCallback(
+    async (username: string, password: string): Promise<string | null> => {
+      if (!settings.registrationOpen && ownerId !== null) {
+        return "Registration is closed";
+      }
 
-    const newId = genId();
-    const newUser: User = {
-      id: newId,
-      username: uname,
-      joinedAt: new Date().toISOString().split("T")[0],
-      banned: false,
-      role: "user",
-    };
+      const uname = username.trim().toLowerCase();
+      if (!uname || !password) return "Enter username and password";
+      if (uname.length < 2 || uname.length > 20)
+        return "Username must be 2-20 chars";
+      if (!/^[a-z0-9_]+$/.test(uname))
+        return "Letters, numbers, underscores only";
+      if (password.length < 6)
+        return "Password must be at least 6 chars";
 
-    await dbPut("users", newUser);
-    await dbPut("passwords", { username: uname, password });
+      // Check duplicate username
+      const { data: existing, error: existingError } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("username", uname)
+        .maybeSingle();
 
-    setUsers(prev => [...prev, newUser]);
-    sessionStorage.setItem("rc_user_id", newId);
-    setUser(newUser);
-    await loadConfigs();
-    broadcast("users");
-    return null;
-  }, [loadConfigs, broadcast]);
+      if (!existingError && existing) return "Username already taken";
+
+      const { data, error } = await supabase.auth.signUp({
+        email: toEmail(uname),
+        password,
+        options: { data: { username: uname } },
+      });
+
+      if (error) {
+        console.error("[rcontrol] signUp error", error);
+        return error.message ?? "Failed to create account";
+      }
+
+      const authUser = data.user;
+      if (!authUser) {
+        // In some Supabase configs, email confirmation is required.
+        return "Check your email to confirm this account before signing in.";
+      }
+
+      const joinedAt = new Date().toISOString().slice(0, 10);
+
+      const { error: profileError } = await supabase.from("profiles").insert({
+        id: authUser.id,
+        username: uname,
+        joined_at: joinedAt,
+        banned: false,
+        role: "user",
+      });
+
+      if (profileError) {
+        console.error("[rcontrol] insert profile error", profileError);
+        return "Account created, but failed to create profile";
+      }
+
+      const profile: User = {
+        id: authUser.id,
+        username: uname,
+        joinedAt,
+        banned: false,
+        role: "user",
+      };
+
+      setUser(profile);
+      await Promise.all([
+        loadUsers(),
+        loadSettings(),
+        loadConfigs(profile.id),
+      ]);
+
+      return null;
+    },
+    [settings.registrationOpen, ownerId, loadUsers, loadSettings, loadConfigs]
+  );
 
   const logout = useCallback(() => {
-    sessionStorage.removeItem("rc_user_id");
+    supabase.auth.signOut().catch((err) => {
+      console.error("[rcontrol] signOut error", err);
+    });
     setUser(null);
-    loadConfigs();
+    loadConfigs(null).catch((err) =>
+      console.error("[rcontrol] loadConfigs after logout", err)
+    );
   }, [loadConfigs]);
 
   // ── Admin actions ─────────────────────────────────────────────────────────
 
   const claimAdmin = useCallback(async (): Promise<boolean> => {
-    const ownerRec = await dbGet<{ key: string; value: string | null }>("meta", "ownerId");
-    if (ownerRec?.value !== null && ownerRec !== undefined) return false;
     if (!user) return false;
-    await dbPut("meta", { key: "ownerId", value: user.id });
-    // Update user role
+
+    const { data: existingOwner, error } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("role", "owner")
+      .maybeSingle();
+
+    if (!error && existingOwner) {
+      return false;
+    }
+
+    const { error: updateError } = await supabase
+      .from("profiles")
+      .update({ role: "owner" })
+      .eq("id", user.id);
+
+    if (updateError) {
+      console.error("[rcontrol] claimAdmin error", updateError);
+      return false;
+    }
+
     const updated: User = { ...user, role: "owner" };
-    await dbPut("users", updated);
     setUser(updated);
-    setUsers(prev => prev.map(u => u.id === user.id ? updated : u));
-    setOwnerIdState(user.id);
-    broadcast("meta");
+    setUsers((prev) => prev.map((u) => (u.id === user.id ? updated : u)));
+    setOwnerId(user.id);
+
     return true;
-  }, [user, broadcast]);
+  }, [user]);
 
-  const promoteAdmin = useCallback(async (id: string): Promise<void> => {
-    if (!user || user.id !== ownerId) return;
-    if (id === ownerId) return;
-    const target = users.find(u => u.id === id);
-    if (!target) return;
-    const updated: User = { ...target, role: "admin" };
-    await dbPut("users", updated);
-    const newAdminIds = adminIds.includes(id) ? adminIds : [...adminIds, id];
-    await dbPut("meta", { key: "adminIds", value: newAdminIds });
-    setAdminIdsState(newAdminIds);
-    setUsers(prev => prev.map(u => u.id === id ? updated : u));
-    broadcast("meta");
-  }, [user, ownerId, adminIds, users, broadcast]);
+  const promoteAdmin = useCallback(
+    async (id: string): Promise<void> => {
+      if (!user || user.id !== ownerId) return;
+      if (id === ownerId) return;
 
-  const demoteAdmin = useCallback(async (id: string): Promise<void> => {
-    if (!user || user.id !== ownerId) return;
-    const target = users.find(u => u.id === id);
-    if (!target) return;
-    const updated: User = { ...target, role: "user" };
-    await dbPut("users", updated);
-    const newAdminIds = adminIds.filter(a => a !== id);
-    await dbPut("meta", { key: "adminIds", value: newAdminIds });
-    setAdminIdsState(newAdminIds);
-    setUsers(prev => prev.map(u => u.id === id ? updated : u));
-    broadcast("meta");
-  }, [user, ownerId, adminIds, users, broadcast]);
+      const { error } = await supabase
+        .from("profiles")
+        .update({ role: "admin" })
+        .eq("id", id);
 
-  const banUser = useCallback(async (id: string): Promise<void> => {
-    if (id === ownerId) return;
-    if (adminIds.includes(id) && user?.id !== ownerId) return;
-    const target = users.find(u => u.id === id);
-    if (!target) return;
-    const updated: User = { ...target, banned: true };
-    await dbPut("users", updated);
-    setUsers(prev => prev.map(u => u.id === id ? updated : u));
-    if (user?.id === id) { sessionStorage.removeItem("rc_user_id"); setUser(null); }
-    broadcast("users");
-  }, [user, ownerId, adminIds, users, broadcast]);
+      if (error) {
+        console.error("[rcontrol] promoteAdmin error", error);
+        return;
+      }
+
+      setUsers((prev) =>
+        prev.map((u) => (u.id === id ? { ...u, role: "admin" } : u))
+      );
+      setAdminIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    },
+    [user, ownerId]
+  );
+
+  const demoteAdmin = useCallback(
+    async (id: string): Promise<void> => {
+      if (!user || user.id !== ownerId) return;
+
+      const { error } = await supabase
+        .from("profiles")
+        .update({ role: "user" })
+        .eq("id", id);
+
+      if (error) {
+        console.error("[rcontrol] demoteAdmin error", error);
+        return;
+      }
+
+      setUsers((prev) =>
+        prev.map((u) => (u.id === id ? { ...u, role: "user" } : u))
+      );
+      setAdminIds((prev) => prev.filter((a) => a !== id));
+    },
+    [user, ownerId]
+  );
+
+  const banUser = useCallback(
+    async (id: string): Promise<void> => {
+      if (id === ownerId) return;
+      if (adminIds.includes(id) && user?.id !== ownerId) return;
+
+      const { error } = await supabase
+        .from("profiles")
+        .update({ banned: true })
+        .eq("id", id);
+
+      if (error) {
+        console.error("[rcontrol] banUser error", error);
+        return;
+      }
+
+      setUsers((prev) =>
+        prev.map((u) => (u.id === id ? { ...u, banned: true } : u))
+      );
+
+      if (user?.id === id) {
+        supabase.auth.signOut().catch(() => {});
+        setUser(null);
+      }
+    },
+    [user, ownerId, adminIds]
+  );
 
   const unbanUser = useCallback(async (id: string): Promise<void> => {
-    const target = users.find(u => u.id === id);
-    if (!target) return;
-    const updated: User = { ...target, banned: false };
-    await dbPut("users", updated);
-    setUsers(prev => prev.map(u => u.id === id ? updated : u));
-    broadcast("users");
-  }, [users, broadcast]);
+    const { error } = await supabase
+      .from("profiles")
+      .update({ banned: false })
+      .eq("id", id);
 
-  const deleteUser = useCallback(async (id: string): Promise<void> => {
-    if (id === ownerId) return;
-    if (adminIds.includes(id) && user?.id !== ownerId) return;
-    const target = users.find(u => u.id === id);
-    if (!target) return;
-    await dbDelete("users", id);
-    await dbDelete("passwords", target.username);
-    const newAdminIds = adminIds.filter(a => a !== id);
-    await dbPut("meta", { key: "adminIds", value: newAdminIds });
-    setAdminIdsState(newAdminIds);
-    setUsers(prev => prev.filter(u => u.id !== id));
-    if (user?.id === id) { sessionStorage.removeItem("rc_user_id"); setUser(null); }
-    broadcast("users");
-  }, [user, ownerId, adminIds, users, broadcast]);
+    if (error) {
+      console.error("[rcontrol] unbanUser error", error);
+      return;
+    }
+
+    setUsers((prev) =>
+      prev.map((u) => (u.id === id ? { ...u, banned: false } : u))
+    );
+  }, []);
+
+  const deleteUser = useCallback(
+    async (id: string): Promise<void> => {
+      if (id === ownerId) return;
+      if (adminIds.includes(id) && user?.id !== ownerId) return;
+
+      const { error: votesError } = await supabase
+        .from("config_votes")
+        .delete()
+        .eq("user_id", id);
+
+      if (votesError) {
+        console.error("[rcontrol] deleteUser votes error", votesError);
+      }
+
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .delete()
+        .eq("id", id);
+
+      if (profileError) {
+        console.error("[rcontrol] deleteUser profile error", profileError);
+        return;
+      }
+
+      setAdminIds((prev) => prev.filter((a) => a !== id));
+      setUsers((prev) => prev.filter((u) => u.id !== id));
+
+      if (user?.id === id) {
+        supabase.auth.signOut().catch(() => {});
+        setUser(null);
+      }
+    },
+    [user, ownerId, adminIds]
+  );
 
   // ── Settings ──────────────────────────────────────────────────────────────
 
-  const updateSettings = useCallback(async (s: Partial<SiteSettings>): Promise<void> => {
-    for (const [key, value] of Object.entries(s)) {
-      await dbPut("settings", { key, value });
-    }
-    setSettings(prev => ({ ...prev, ...s }));
-    broadcast("settings");
-  }, [broadcast]);
+  const updateSettings = useCallback(
+    async (s: Partial<SiteSettings>): Promise<void> => {
+      const entries = Object.entries(s) as [
+        keyof SiteSettings,
+        SiteSettings[keyof SiteSettings]
+      ][];
+
+      for (const [key, value] of entries) {
+        const { error } = await supabase
+          .from("site_settings")
+          .upsert({ key, value }, { onConflict: "key" });
+
+        if (error) {
+          console.error("[rcontrol] updateSettings error", error);
+        }
+      }
+
+      setSettings((prev) => ({ ...prev, ...s }));
+    },
+    []
+  );
 
   // ── Configs ───────────────────────────────────────────────────────────────
 
-  const addConfig = useCallback(async (
-    cfg: Omit<Config, "id" | "author" | "authorId" | "votes" | "createdAt" | "voted">
-  ): Promise<void> => {
-    if (!user) return;
-    const newConfig: Config = {
-      ...cfg,
-      id: genId(),
-      author: user.username,
-      authorId: user.id,
-      votes: 0,
-      createdAt: new Date().toISOString().split("T")[0],
-    };
-    await dbPut("configs", newConfig);
-    setConfigs(prev => [{ ...newConfig, voted: false }, ...prev]);
-    broadcast("configs");
-  }, [user, broadcast]);
+  const addConfig = useCallback(
+    async (
+      cfg: Omit<
+        Config,
+        "id" | "author" | "authorId" | "votes" | "createdAt" | "voted"
+      >
+    ): Promise<void> => {
+      if (!user) return;
 
-  const voteConfig = useCallback(async (id: string): Promise<void> => {
-    if (!user) return;
-    const voteId = `${user.id}_${id}`;
-    const existing = await dbGet<{ id: string }>("votes", voteId);
-    const config = configs.find(c => c.id === id);
-    if (!config) return;
+      const { data, error } = await supabase
+        .from("configs")
+        .insert({
+          name: cfg.name,
+          author_id: user.id,
+          author_name: user.username,
+          mode: cfg.mode,
+          software: cfg.software,
+          description: cfg.description,
+          settings: cfg.settings,
+          votes: 0,
+          filename: cfg.filename ?? null,
+          json_content: cfg.jsonContent ?? null,
+        })
+        .select(
+          "id, name, author_id, author_name, mode, software, description, settings, votes, created_at, filename, json_content"
+        )
+        .maybeSingle();
 
-    if (existing) {
-      // Un-vote
-      await dbDelete("votes", voteId);
-      const updated = { ...config, votes: Math.max(0, config.votes - 1), voted: false };
-      await dbPut("configs", { ...updated });
-      setConfigs(prev => prev.map(c => c.id === id ? updated : c));
-    } else {
-      // Vote
-      await dbPut("votes", { id: voteId, userId: user.id, configId: id });
-      const updated = { ...config, votes: config.votes + 1, voted: true };
-      await dbPut("configs", { ...updated });
-      setConfigs(prev => prev.map(c => c.id === id ? updated : c));
-    }
-    broadcast("configs");
-  }, [user, configs, broadcast]);
+      if (error || !data) {
+        console.error("[rcontrol] addConfig error", error);
+        return;
+      }
+
+      const mapped: Config = {
+        id: data.id,
+        name: data.name,
+        authorId: data.author_id,
+        author: data.author_name,
+        mode: data.mode,
+        software: data.software,
+        description: data.description,
+        settings: data.settings ?? [],
+        votes: data.votes ?? 0,
+        createdAt: (data.created_at ?? "").slice(0, 10),
+        voted: false,
+        filename: data.filename ?? undefined,
+        jsonContent: data.json_content ?? undefined,
+      };
+
+      setConfigs((prev) => [mapped, ...prev]);
+    },
+    [user]
+  );
+
+  const voteConfig = useCallback(
+    async (id: string): Promise<void> => {
+      if (!user) return;
+
+      const existingConfig = configs.find((c) => c.id === id);
+      if (!existingConfig) return;
+
+      const { data: existingVote, error: existingError } = await supabase
+        .from("config_votes")
+        .select("id")
+        .eq("user_id", user.id)
+        .eq("config_id", id)
+        .maybeSingle();
+
+      if (!existingError && existingVote) {
+        // Un-vote
+        const { error: deleteError } = await supabase
+          .from("config_votes")
+          .delete()
+          .eq("id", existingVote.id);
+
+        if (deleteError) {
+          console.error("[rcontrol] voteConfig delete error", deleteError);
+          return;
+        }
+
+        const newVotes = Math.max(0, existingConfig.votes - 1);
+        const { error: updateError } = await supabase
+          .from("configs")
+          .update({ votes: newVotes })
+          .eq("id", id);
+
+        if (updateError) {
+          console.error("[rcontrol] voteConfig update error", updateError);
+          return;
+        }
+
+        setConfigs((prev) =>
+          prev.map((c) =>
+            c.id === id ? { ...c, votes: newVotes, voted: false } : c
+          )
+        );
+      } else {
+        // Vote
+        const { error: insertError } = await supabase
+          .from("config_votes")
+          .insert({ user_id: user.id, config_id: id });
+
+        if (insertError) {
+          console.error("[rcontrol] voteConfig insert error", insertError);
+          return;
+        }
+
+        const newVotes = existingConfig.votes + 1;
+        const { error: updateError } = await supabase
+          .from("configs")
+          .update({ votes: newVotes })
+          .eq("id", id);
+
+        if (updateError) {
+          console.error("[rcontrol] voteConfig update error", updateError);
+          return;
+        }
+
+        setConfigs((prev) =>
+          prev.map((c) =>
+            c.id === id ? { ...c, votes: newVotes, voted: true } : c
+          )
+        );
+      }
+    },
+    [user, configs]
+  );
 
   const deleteConfig = useCallback(async (id: string): Promise<void> => {
-    await dbDelete("configs", id);
-    setConfigs(prev => prev.filter(c => c.id !== id));
-    broadcast("configs");
-  }, [broadcast]);
+    const { error: votesError } = await supabase
+      .from("config_votes")
+      .delete()
+      .eq("config_id", id);
+
+    if (votesError) {
+      console.error("[rcontrol] deleteConfig votes error", votesError);
+    }
+
+    const { error } = await supabase.from("configs").delete().eq("id", id);
+
+    if (error) {
+      console.error("[rcontrol] deleteConfig error", error);
+      return;
+    }
+
+    setConfigs((prev) => prev.filter((c) => c.id !== id));
+  }, []);
 
   const refreshConfigs = useCallback(async () => {
     await loadConfigs();
@@ -466,48 +691,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const refreshUsers = useCallback(async () => {
     await loadUsers();
-    const meta = await loadMeta();
-    setOwnerIdState(meta.ownerId);
-    setAdminIdsState(meta.adminIds);
-  }, [loadUsers, loadMeta]);
+  }, [loadUsers]);
 
-  // ── Derived ───────────────────────────────────────────────────────────────
+  // ── Derived flags ─────────────────────────────────────────────────────────
 
   const isOwner = user !== null && user.id === ownerId;
   const isAdmin = isOwner || (user !== null && adminIds.includes(user.id));
 
-  return (
-    <AuthContext.Provider
-      value={{
-        user,
-        users,
-        configs,
-        settings,
-        loading,
-        login,
-        register,
-        logout,
-        isOwner,
-        isAdmin,
-        ownerId,
-        adminIds,
-        claimAdmin,
-        promoteAdmin,
-        demoteAdmin,
-        banUser,
-        unbanUser,
-        deleteUser,
-        updateSettings,
-        addConfig,
-        voteConfig,
-        deleteConfig,
-        refreshConfigs,
-        refreshUsers,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
-  );
+  const value: AuthState = {
+    user,
+    users,
+    configs,
+    settings,
+    loading,
+    login,
+    register,
+    logout,
+    isOwner,
+    isAdmin,
+    ownerId,
+    adminIds,
+    claimAdmin,
+    promoteAdmin,
+    demoteAdmin,
+    banUser,
+    unbanUser,
+    deleteUser,
+    updateSettings,
+    addConfig,
+    voteConfig,
+    deleteConfig,
+    refreshConfigs,
+    refreshUsers,
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
 export function useAuth() {

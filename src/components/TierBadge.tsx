@@ -1,6 +1,6 @@
 import type { Tier } from "../types";
 
-const cfg: Record<Tier, string> = {
+const tierStyles: Record<Tier, string> = {
   "S+": "bg-red-500/10 text-red-400",
   S: "bg-amber-500/10 text-amber-400",
   A: "bg-blue-500/10 text-blue-400",
@@ -10,7 +10,9 @@ const cfg: Record<Tier, string> = {
 
 export default function TierBadge({ tier }: { tier: Tier }) {
   return (
-    <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cfg[tier]}`}>
+    <span
+      className={`inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium ${tierStyles[tier]}`}
+    >
       {tier}
     </span>
   );
